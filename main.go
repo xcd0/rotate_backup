@@ -658,16 +658,16 @@ func runBackup(configPath string) error {
 	}
 	copyDur := time.Since(copyStart)
 
-	// 30分バックアップ用ディレクトリに VHDX を保存します。
-	if err := saveBackup(cfg.BackupDirs["30m"], filename, cfg.SourceVHDX, cfg.DryRun); err != nil {
-		return pkgerrors.Errorf("バックアップ保存失敗: %v", err)
-	}
-
-	// 各階層で古いバックアップを削除し、昇格を行います。
+	// ローテーション処理: 新しいファイルを保存する前に昇格・削除処理を実行
 	levels := []string{"30m", "3h", "6h", "12h", "1d"}
 	if cfg.DryRun {
 		fmt.Println("ローテーション処理:")
 	}
+	
+	// まず昇格処理を実行（新しいファイル保存前に行うことが重要）
+	promoteBackup(cfg, levels, cfg.DryRun)
+	
+	// その後、各レベルで上限超過分を削除
 	for _, lvl := range levels {
 		if err := rotateBackupsWithPromotion(cfg, lvl, cfg.DryRun); err != nil {
 			if !cfg.DryRun {
@@ -675,7 +675,11 @@ func runBackup(configPath string) error {
 			}
 		}
 	}
-	promoteBackup(cfg, levels, cfg.DryRun)
+
+	// 30分バックアップ用ディレクトリに VHDX を保存します。
+	if err := saveBackup(cfg.BackupDirs["30m"], filename, cfg.SourceVHDX, cfg.DryRun); err != nil {
+		return pkgerrors.Errorf("バックアップ保存失敗: %v", err)
+	}
 
 	// 処理時間をパフォーマンスログに記録します。
 	logPerformance(cfg.PerfLogPath, startTime, copyDur, time.Since(startTime)-copyDur, cfg.DryRun)
@@ -1688,6 +1692,7 @@ func rotateBackupsWithPromotion(cfg *BackupConfig, level string, dryRun bool) er
 }
 
 // promoteBackup は下位レベルから上位レベルへ古いファイルを昇格します。
+// 新しいファイルが追加される前に実行されるべきです。
 func promoteBackup(cfg *BackupConfig, levels []string, dryRun bool) {
 	if dryRun {
 		fmt.Println("昇格処理:")
@@ -1725,22 +1730,28 @@ func promoteBackup(cfg *BackupConfig, levels []string, dryRun bool) {
 		}
 		sort.Strings(names)
 
-		if len(names) > cfg.KeepVersions[levels[i]] {
+		// 現在のレベルが保持数を超える場合、最古のファイルを昇格
+		if len(names) >= cfg.KeepVersions[levels[i]] {
 			old := names[0]
 			if dryRun {
-				fmt.Printf("    → %s を昇格予定\n", old)
+				fmt.Printf("    → %s を昇格予定 (現在数: %d, 保持数: %d)\n", old, len(names), cfg.KeepVersions[levels[i]])
 			} else {
 				src := filepath.Join(curDir, old)
 				dst := filepath.Join(nextDir, old)
 				if _, err := os.Stat(dst); os.IsNotExist(err) {
-					os.Rename(src, dst)
+					if err := os.Rename(src, dst); err != nil {
+						log.Printf("昇格失敗 %s → %s: %v", src, dst, err)
+					} else {
+						log.Printf("昇格成功: %s を %s から %s へ移動", old, levels[i], levels[i+1])
+					}
 				} else {
+					log.Printf("昇格先に同名ファイルが存在するため削除: %s", src)
 					os.Remove(src)
 				}
 			}
 		} else {
 			if dryRun {
-				fmt.Println("    → 昇格対象なし")
+				fmt.Printf("    → 昇格対象なし (現在数: %d, 保持数: %d)\n", len(names), cfg.KeepVersions[levels[i]])
 			}
 		}
 	}
