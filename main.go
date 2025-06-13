@@ -560,9 +560,28 @@ func runBackup(configPath string) error {
 	log.Printf("設定ファイルを読み込み中: %s", configPath)
 	cfg, err := loadConfig(configPath)
 	if err != nil {
-		fmt.Printf("設定ファイルの読み込みエラー: %v\n", err)
-		fmt.Println("--init-config でテンプレートを生成してください。")
-		return err
+		// 設定ファイルが見つからない場合は自動生成を試行
+		if os.IsNotExist(err) && isDefaultConfigPath(configPath) {
+			fmt.Printf("設定ファイルが見つかりません: %s\n", configPath)
+			fmt.Printf("既定の設定ファイルを自動生成します...\n")
+			if genErr := generateTemplate(configPath); genErr != nil {
+				fmt.Printf("設定ファイルの自動生成に失敗しました: %v\n", genErr)
+				fmt.Println("--init-config でテンプレートを生成してください。")
+				return err
+			}
+			fmt.Printf("設定ファイルを生成しました: %s\n", configPath)
+			fmt.Println("dry_run が true に設定されています。設定を確認後、false に変更してください。")
+			// 生成された設定ファイルを再読み込み
+			cfg, err = loadConfig(configPath)
+			if err != nil {
+				fmt.Printf("生成された設定ファイルの読み込みエラー: %v\n", err)
+				return err
+			}
+		} else {
+			fmt.Printf("設定ファイルの読み込みエラー: %v\n", err)
+			fmt.Println("--init-config でテンプレートを生成してください。")
+			return err
+		}
 	}
 	log.Printf("設定ファイルの読み込みが完了しました")
 
@@ -702,9 +721,28 @@ func runUpdateBackup(configPath string) error {
 	log.Printf("設定ファイルを読み込み中: %s", configPath)
 	cfg, err := loadConfig(configPath)
 	if err != nil {
-		fmt.Printf("設定ファイルの読み込みエラー: %v\n", err)
-		fmt.Println("--init-config でテンプレートを生成してください。")
-		return err
+		// 設定ファイルが見つからない場合は自動生成を試行
+		if os.IsNotExist(err) && isDefaultConfigPath(configPath) {
+			fmt.Printf("設定ファイルが見つかりません: %s\n", configPath)
+			fmt.Printf("既定の設定ファイルを自動生成します...\n")
+			if genErr := generateTemplate(configPath); genErr != nil {
+				fmt.Printf("設定ファイルの自動生成に失敗しました: %v\n", genErr)
+				fmt.Println("--init-config でテンプレートを生成してください。")
+				return err
+			}
+			fmt.Printf("設定ファイルを生成しました: %s\n", configPath)
+			fmt.Println("dry_run が true に設定されています。設定を確認後、false に変更してください。")
+			// 生成された設定ファイルを再読み込み
+			cfg, err = loadConfig(configPath)
+			if err != nil {
+				fmt.Printf("生成された設定ファイルの読み込みエラー: %v\n", err)
+				return err
+			}
+		} else {
+			fmt.Printf("設定ファイルの読み込みエラー: %v\n", err)
+			fmt.Println("--init-config でテンプレートを生成してください。")
+			return err
+		}
 	}
 	log.Printf("設定ファイルの読み込みが完了しました")
 
@@ -945,6 +983,31 @@ on_lock_conflict: "notify-exit"
 
 }`
 	return ioutil.WriteFile(destPath, []byte(template), 0644)
+}
+
+// isDefaultConfigPath は指定されたパスがデフォルトの設定ファイルパスかどうかを判定します。
+func isDefaultConfigPath(configPath string) bool {
+	// デフォルトの設定ファイルパスと比較
+	// 絶対パス・相対パスの両方に対応
+	absPath, _ := filepath.Abs(configPath)
+	defaultPaths := []string{
+		"config.hjson",
+		"./config.hjson",
+	}
+	
+	for _, defaultPath := range defaultPaths {
+		if configPath == defaultPath {
+			return true
+		}
+		// 絶対パスでも比較
+		if absDefaultPath, err := filepath.Abs(defaultPath); err == nil {
+			if absPath == absDefaultPath {
+				return true
+			}
+		}
+	}
+	
+	return false
 }
 
 // loadConfig は HJSON 設定を読み込み BackupConfig を返します。
