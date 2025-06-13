@@ -1,0 +1,8 @@
+.claude/
+*.hjson
+*.txt
+*.tsv
+rotate_backup
+rotate_backup.exe
+
+
