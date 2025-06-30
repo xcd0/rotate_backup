@@ -272,18 +272,21 @@ func cleanupUnwantedFiles(cfg *BackupConfig, src, dst string) bool {
 			} else {
 				// ソース側にファイルが存在する場合、拡張子をチェック
 				if len(cfg.Extensions) > 0 {
-					ext := strings.ToLower(filepath.Ext(dstPath))
 					matched := false
+					fileName := strings.ToLower(filepath.Base(dstPath))
+					
 					for _, allowedExt := range cfg.Extensions {
-						if strings.ToLower(allowedExt) == ext {
+						allowedExt = strings.ToLower(allowedExt)
+						if strings.HasSuffix(fileName, allowedExt) {
 							matched = true
 							break
 						}
 					}
 					
 					if !matched {
-						shouldDelete = true
+						ext := strings.ToLower(filepath.Ext(dstPath))
 						log.Printf("対象外拡張子のファイルを削除: %s (拡張子: %s)", dstPath, ext)
+						shouldDelete = true
 					}
 				}
 			}
@@ -1794,7 +1797,7 @@ func promoteBackup(cfg *BackupConfig, levels []string, dryRun bool) {
 		sort.Strings(names)
 
 		// 現在のレベルが保持数を超える場合、最古のファイルを昇格
-		if len(names) >= cfg.KeepVersions[levels[i]] {
+		if len(names) > cfg.KeepVersions[levels[i]] {
 			old := names[0]
 			if dryRun {
 				fmt.Printf("    → %s を昇格予定 (現在数: %d, 保持数: %d)\n", old, len(names), cfg.KeepVersions[levels[i]])
