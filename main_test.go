@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -803,5 +804,429 @@ func TestConfigurationIssues(t *testing.T) {
 	// 記録もエラーなく動作することを確認
 	if err := recordLastExecution(config, level, testTime); err != nil {
 		t.Errorf("設定無しでの記録エラー: %v", err)
+	}
+}
+
+// =============================================================================
+// シェル自動判定機能のテスト
+// =============================================================================
+
+func TestDetectCurrentShell(t *testing.T) {
+	// 元の環境変数を保存
+	originalShell := os.Getenv("SHELL")
+	originalWSL := os.Getenv("WSL_DISTRO_NAME")
+	originalPSModulePath := os.Getenv("PSModulePath")
+	
+	defer func() {
+		// 環境変数を復元
+		os.Setenv("SHELL", originalShell)
+		os.Setenv("WSL_DISTRO_NAME", originalWSL)
+		os.Setenv("PSModulePath", originalPSModulePath)
+	}()
+	
+	tests := []struct {
+		name            string
+		shell           string
+		wslDistro       string
+		psModulePath    string
+		expectedShell   string
+		description     string
+	}{
+		{
+			name:          "WSL環境でのbash判定",
+			shell:         "/bin/bash",
+			wslDistro:     "Ubuntu",
+			psModulePath:  "",
+			expectedShell: "bash",
+			description:   "WSL環境ではSHELL環境変数を優先",
+		},
+		{
+			name:          "WSL環境でのzsh判定",
+			shell:         "/usr/bin/zsh",
+			wslDistro:     "Ubuntu",
+			psModulePath:  "",
+			expectedShell: "zsh",
+			description:   "WSL環境でzshを検出",
+		},
+		{
+			name:          "WSL環境でのfish判定",
+			shell:         "/usr/bin/fish",
+			wslDistro:     "Ubuntu",
+			psModulePath:  "",
+			expectedShell: "fish",
+			description:   "WSL環境でfishを検出",
+		},
+		{
+			name:          "非WSL環境でのbash判定",
+			shell:         "/bin/bash",
+			wslDistro:     "",
+			psModulePath:  "",
+			expectedShell: func() string {
+				if runtime.GOOS == "windows" {
+					return "powershell"
+				}
+				return "bash"
+			}(),
+			description:   "非WSL環境でのシェル判定（ビルド環境に依存）",
+		},
+		{
+			name:          "PowerShell環境の判定",
+			shell:         "",
+			wslDistro:     "",
+			psModulePath:  "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules",
+			expectedShell: "powershell",
+			description:   "PowerShell環境を検出",
+		},
+		{
+			name:          "未知のシェル環境",
+			shell:         "/unknown/shell",
+			wslDistro:     "",
+			psModulePath:  "",
+			expectedShell: func() string {
+				if runtime.GOOS == "windows" {
+					return "powershell"
+				}
+				return "bash"
+			}(),
+			description:   "未知の環境でのデフォルト判定（ビルド環境に依存）",
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 環境変数を設定
+			os.Setenv("SHELL", tt.shell)
+			os.Setenv("WSL_DISTRO_NAME", tt.wslDistro)
+			os.Setenv("PSModulePath", tt.psModulePath)
+			
+			// シェル判定を実行
+			detectedShell := detectCurrentShell()
+			
+			if detectedShell != tt.expectedShell {
+				t.Errorf("シェル判定失敗: 期待=%s, 実際=%s (%s)",
+					tt.expectedShell, detectedShell, tt.description)
+			}
+			
+			t.Logf("✓ %s: %s", tt.name, tt.description)
+		})
+	}
+}
+
+// =============================================================================
+// 補完スクリプト生成機能のテスト
+// =============================================================================
+
+func TestGenerateCompletionScript(t *testing.T) {
+	tests := []struct {
+		shell       string
+		shouldError bool
+		description string
+	}{
+		{
+			shell:       "bash",
+			shouldError: false,
+			description: "bash用補完スクリプト生成",
+		},
+		{
+			shell:       "zsh",
+			shouldError: false,
+			description: "zsh用補完スクリプト生成",
+		},
+		{
+			shell:       "fish",
+			shouldError: false,
+			description: "fish用補完スクリプト生成",
+		},
+		{
+			shell:       "powershell",
+			shouldError: false,
+			description: "powershell用補完スクリプト生成",
+		},
+		{
+			shell:       "pwsh",
+			shouldError: false,
+			description: "pwsh用補完スクリプト生成",
+		},
+		{
+			shell:       "unsupported",
+			shouldError: true,
+			description: "サポートされていないシェル",
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.shell, func(t *testing.T) {
+			// 標準出力をキャプチャするために一時的にリダイレクト
+			oldStdout := os.Stdout
+			r, w, _ := os.Pipe()
+			os.Stdout = w
+			
+			var output bytes.Buffer
+			done := make(chan bool)
+			go func() {
+				buf := make([]byte, 1024)
+				for {
+					n, err := r.Read(buf)
+					if n > 0 {
+						output.Write(buf[:n])
+					}
+					if err != nil {
+						break
+					}
+				}
+				done <- true
+			}()
+			
+			// 補完スクリプト生成を実行
+			err := generateCompletionScript(tt.shell)
+			
+			// 標準出力を復元
+			w.Close()
+			os.Stdout = oldStdout
+			<-done
+			r.Close()
+			
+			// 結果を検証
+			if tt.shouldError {
+				if err == nil {
+					t.Errorf("エラーが期待されましたが成功しました: %s", tt.description)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("補完スクリプト生成エラー: %v (%s)", err, tt.description)
+				}
+				
+				// 出力内容の簡単な検証
+				outputStr := output.String()
+				if len(outputStr) == 0 {
+					t.Errorf("補完スクリプトの出力が空です: %s", tt.description)
+				}
+				
+				// 各シェル固有の内容があることを確認
+				switch tt.shell {
+				case "bash":
+					if !strings.Contains(outputStr, "bash") {
+						t.Errorf("bash用補完スクリプトにbash固有の内容が含まれていません")
+					}
+				case "zsh":
+					if !strings.Contains(outputStr, "zsh") {
+						t.Errorf("zsh用補完スクリプトにzsh固有の内容が含まれていません")
+					}
+				case "fish":
+					if !strings.Contains(outputStr, "complete") {
+						t.Errorf("fish用補完スクリプトにfish固有の内容が含まれていません")
+					}
+				case "powershell", "pwsh":
+					if !strings.Contains(outputStr, "Register-ArgumentCompleter") {
+						t.Errorf("PowerShell用補完スクリプトにPowerShell固有の内容が含まれていません")
+					}
+				}
+			}
+			
+			t.Logf("✓ %s: %s", tt.shell, tt.description)
+		})
+	}
+}
+
+// =============================================================================
+// 設定ファイル読み込みのテスト
+// =============================================================================
+
+func TestLoadConfigDryRun(t *testing.T) {
+	// テスト用ディレクトリ作成
+	tempDir, err := os.MkdirTemp("", "config_test")
+	if err != nil {
+		t.Fatalf("一時ディレクトリの作成に失敗: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	
+	tests := []struct {
+		name        string
+		configData  string
+		expectedDry bool
+		shouldError bool
+		description string
+	}{
+		{
+			name: "dry_run=true設定",
+			configData: `{
+				"dry_run": true,
+				"work_dir": "/test/work",
+				"backup_dir": "/test/backup"
+			}`,
+			expectedDry: true,
+			shouldError: false,
+			description: "dry_runがtrueに設定されている",
+		},
+		{
+			name: "dry_run=false設定",
+			configData: `{
+				"dry_run": false,
+				"work_dir": "/test/work",
+				"backup_dir": "/test/backup"
+			}`,
+			expectedDry: false,
+			shouldError: false,
+			description: "dry_runがfalseに設定されている",
+		},
+		{
+			name: "HJSON形式のdry_run=true",
+			configData: `{
+				// コメント付きの設定
+				dry_run: true,
+				work_dir: "/test/work",
+				backup_dir: "/test/backup",
+			}`,
+			expectedDry: true,
+			shouldError: false,
+			description: "HJSON形式でdry_runがtrueに設定",
+		},
+		{
+			name: "HJSON形式のdry_run=false",
+			configData: `{
+				// 実行モード設定
+				dry_run: false,
+				work_dir: "/test/work",
+				backup_dir: "/test/backup",
+			}`,
+			expectedDry: false,
+			shouldError: false,
+			description: "HJSON形式でdry_runがfalseに設定",
+		},
+		{
+			name: "不正なHJSON構文",
+			configData: `{
+				dry_run: true,
+				work_dir: "/test/work",
+				backup_dir: "/test/backup",
+				invalid_syntax: [broken
+			}`,
+			expectedDry: false,
+			shouldError: true,
+			description: "構文エラーのあるHJSON",
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// テスト用設定ファイルを作成
+			configPath := filepath.Join(tempDir, fmt.Sprintf("config_%s.hjson", tt.name))
+			err := os.WriteFile(configPath, []byte(tt.configData), 0644)
+			if err != nil {
+				t.Fatalf("テスト設定ファイルの作成に失敗: %v", err)
+			}
+			
+			// 設定を読み込み
+			cfg, err := loadConfig(configPath)
+			
+			if tt.shouldError {
+				if err == nil {
+					t.Errorf("エラーが期待されましたが成功しました: %s", tt.description)
+				}
+				return
+			}
+			
+			if err != nil {
+				t.Fatalf("設定読み込みエラー: %v (%s)", err, tt.description)
+			}
+			
+			// dry_runの値を検証
+			if cfg.DryRun != tt.expectedDry {
+				t.Errorf("dry_run設定が間違っています: 期待=%v, 実際=%v (%s)",
+					tt.expectedDry, cfg.DryRun, tt.description)
+			}
+			
+			t.Logf("✓ %s: dry_run=%v (%s)", tt.name, cfg.DryRun, tt.description)
+		})
+	}
+}
+
+// =============================================================================
+// バックアップタイミング判定のテスト
+// =============================================================================
+
+func TestDetermineBestBackupLevelTiming(t *testing.T) {
+	tests := []struct {
+		name        string
+		time        time.Time
+		shouldRun   bool
+		level       string
+		description string
+	}{
+		{
+			name:        "30分タイミング_10:30",
+			time:        time.Date(2025, 7, 1, 10, 30, 0, 0, time.Local),
+			shouldRun:   true,
+			level:       "30m",
+			description: "30分間隔バックアップの実行タイミング",
+		},
+		{
+			name:        "30分タイミング_14:00",
+			time:        time.Date(2025, 7, 1, 14, 0, 0, 0, time.Local),
+			shouldRun:   true,
+			level:       "30m",
+			description: "正時の30分間隔バックアップ（他の条件と重複しない時間）",
+		},
+		{
+			name:        "非タイミング_10:15",
+			time:        time.Date(2025, 7, 1, 10, 15, 0, 0, time.Local),
+			shouldRun:   false,
+			level:       "",
+			description: "バックアップタイミング外",
+		},
+		{
+			name:        "非タイミング_10:45",
+			time:        time.Date(2025, 7, 1, 10, 45, 0, 0, time.Local),
+			shouldRun:   false,
+			level:       "",
+			description: "バックアップタイミング外",
+		},
+		{
+			name:        "3時間タイミング_09:00",
+			time:        time.Date(2025, 7, 1, 9, 0, 0, 0, time.Local),
+			shouldRun:   true,
+			level:       "3h",
+			description: "3時間間隔バックアップの実行タイミング",
+		},
+		{
+			name:        "6時間タイミング_06:00",
+			time:        time.Date(2025, 7, 1, 6, 0, 0, 0, time.Local),
+			shouldRun:   true,
+			level:       "6h",
+			description: "6時間間隔バックアップの実行タイミング",
+		},
+		{
+			name:        "12時間タイミング_12:00",
+			time:        time.Date(2025, 7, 1, 12, 0, 0, 0, time.Local),
+			shouldRun:   true,
+			level:       "12h",
+			description: "12時間間隔バックアップの実行タイミング",
+		},
+		{
+			name:        "1日タイミング_00:00",
+			time:        time.Date(2025, 7, 1, 0, 0, 0, 0, time.Local),
+			shouldRun:   true,
+			level:       "1d",
+			description: "1日間隔バックアップの実行タイミング（最優先）",
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shouldRun, level := determineBestBackupLevel(tt.time)
+			
+			if shouldRun != tt.shouldRun {
+				t.Errorf("バックアップ実行判定が間違っています: 期待=%v, 実際=%v (%s)",
+					tt.shouldRun, shouldRun, tt.description)
+			}
+			
+			if level != tt.level {
+				t.Errorf("バックアップレベルが間違っています: 期待=%s, 実際=%s (%s)",
+					tt.level, level, tt.description)
+			}
+			
+			t.Logf("✓ %s: shouldRun=%v, level=%s (%s)",
+				tt.name, shouldRun, level, tt.description)
+		})
 	}
 }
