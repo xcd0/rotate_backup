@@ -23,6 +23,7 @@ import (
 	"github.com/hjson/hjson-go"
 	pkgerrors "github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
 )
@@ -531,7 +532,295 @@ type DaemonCmd struct {
 var (
 	pidFile  string
 	logLevel string
+	printDetails bool  // --print フラグ用
 )
+
+// detectCurrentShell は現在実行中のシェルを検出します。
+func detectCurrentShell() string {
+	// WSL環境での優先判定
+	if os.Getenv("WSL_DISTRO_NAME") != "" {
+		shell := os.Getenv("SHELL")
+		if shell != "" {
+			shellName := filepath.Base(shell)
+			switch shellName {
+			case "bash":
+				return "bash"
+			case "zsh":
+				return "zsh"
+			case "fish":
+				return "fish"
+			}
+		}
+	}
+
+	// Linux/Unix環境での環境変数SHELLから判定
+	if runtime.GOOS != "windows" {
+		shell := os.Getenv("SHELL")
+		if shell != "" {
+			shellName := filepath.Base(shell)
+			switch shellName {
+			case "bash":
+				return "bash"
+			case "zsh":
+				return "zsh"
+			case "fish":
+				return "fish"
+			}
+		}
+
+		// 親プロセス名から判定
+		parentPID := os.Getppid()
+		if parentPID > 0 {
+			commPath := fmt.Sprintf("/proc/%d/comm", parentPID)
+			if data, err := os.ReadFile(commPath); err == nil {
+				parentName := strings.TrimSpace(string(data))
+				switch parentName {
+				case "bash":
+					return "bash"
+				case "zsh":
+					return "zsh"
+				case "fish":
+					return "fish"
+				}
+			}
+		}
+	}
+
+	// Windows環境の場合
+	if runtime.GOOS == "windows" {
+		// PowerShellの判定
+		if os.Getenv("PSModulePath") != "" {
+			return "powershell"
+		}
+		// その他の場合はcmdだが、PowerShellとして扱う
+		return "powershell"
+	}
+
+	// デフォルトはbash
+	return "bash"
+}
+
+// generateCompletionScript は指定されたシェル用の補完スクリプトを生成します。
+func generateCompletionScript(shell string) error {
+	switch shell {
+	case "bash":
+		return rootCmd.GenBashCompletion(os.Stdout)
+	case "zsh":
+		return rootCmd.GenZshCompletion(os.Stdout)
+	case "fish":
+		return rootCmd.GenFishCompletion(os.Stdout, true)
+	case "powershell", "pwsh":
+		return rootCmd.GenPowerShellCompletion(os.Stdout)
+	default:
+		return fmt.Errorf("サポートされていないシェル: %s", shell)
+	}
+}
+
+// printCompletionInstructions は補完スクリプトのインストール方法を表示します。
+func printCompletionInstructions(shell string, programName string) {
+	fmt.Fprintf(os.Stderr, "\n# %s用の補完スクリプトが生成されました\n", shell)
+	fmt.Fprintf(os.Stderr, "# 以下のコマンドでインストールできます:\n\n")
+
+	switch shell {
+	case "bash":
+		fmt.Fprintf(os.Stderr, "# 一時的な有効化:\n")
+		fmt.Fprintf(os.Stderr, "source <(%s auto-completion)\n\n", programName)
+		fmt.Fprintf(os.Stderr, "# 永続的な有効化:\n")
+		fmt.Fprintf(os.Stderr, "echo 'source <(%s auto-completion)' >> ~/.bashrc\n", programName)
+		fmt.Fprintf(os.Stderr, "# または:\n")
+		fmt.Fprintf(os.Stderr, "%s auto-completion > /etc/bash_completion.d/%s\n", programName, programName)
+
+	case "zsh":
+		fmt.Fprintf(os.Stderr, "# 一時的な有効化:\n")
+		fmt.Fprintf(os.Stderr, "source <(%s auto-completion)\n\n", programName)
+		fmt.Fprintf(os.Stderr, "# 永続的な有効化:\n")
+		fmt.Fprintf(os.Stderr, "echo 'source <(%s auto-completion)' >> ~/.zshrc\n", programName)
+		fmt.Fprintf(os.Stderr, "# または zsh completion directory に保存:\n")
+		fmt.Fprintf(os.Stderr, "%s auto-completion > ~/.zsh/completions/_%s\n", programName, programName)
+
+	case "fish":
+		fmt.Fprintf(os.Stderr, "# fish用補完スクリプトの保存:\n")
+		fmt.Fprintf(os.Stderr, "%s auto-completion > ~/.config/fish/completions/%s.fish\n", programName, programName)
+
+	case "powershell", "pwsh":
+		fmt.Fprintf(os.Stderr, "# PowerShell用補完スクリプトの追加:\n")
+		fmt.Fprintf(os.Stderr, "%s auto-completion >> $PROFILE\n", programName)
+		fmt.Fprintf(os.Stderr, "# または:\n")
+		fmt.Fprintf(os.Stderr, "%s auto-completion | Out-String | Invoke-Expression\n", programName)
+	}
+
+	fmt.Fprintf(os.Stderr, "\n")
+}
+
+// printCompletionDetails は補完機能に関する詳細情報を表示します。
+func printCompletionDetails(shell string, programName string) {
+	fmt.Fprintf(os.Stderr, "=== Completion Script Details ===\n")
+	fmt.Fprintf(os.Stderr, "プログラム名: %s\n", programName)
+	fmt.Fprintf(os.Stderr, "検出されたシェル: %s\n", shell)
+	fmt.Fprintf(os.Stderr, "実行環境: %s\n", runtime.GOOS)
+	
+	// 環境変数情報
+	fmt.Fprintf(os.Stderr, "\n--- 環境変数情報 ---\n")
+	fmt.Fprintf(os.Stderr, "SHELL: %s\n", os.Getenv("SHELL"))
+	fmt.Fprintf(os.Stderr, "WSL_DISTRO_NAME: %s\n", os.Getenv("WSL_DISTRO_NAME"))
+	fmt.Fprintf(os.Stderr, "PSModulePath: %s\n", os.Getenv("PSModulePath"))
+	
+	// プロセス情報
+	fmt.Fprintf(os.Stderr, "\n--- プロセス情報 ---\n")
+	fmt.Fprintf(os.Stderr, "PID: %d\n", os.Getpid())
+	fmt.Fprintf(os.Stderr, "PPID: %d\n", os.Getppid())
+	
+	// 親プロセス情報（Linux/WSL）
+	if runtime.GOOS != "windows" {
+		parentPID := os.Getppid()
+		commPath := fmt.Sprintf("/proc/%d/comm", parentPID)
+		if data, err := os.ReadFile(commPath); err == nil {
+			parentName := strings.TrimSpace(string(data))
+			fmt.Fprintf(os.Stderr, "親プロセス名: %s\n", parentName)
+		}
+	}
+	
+	fmt.Fprintf(os.Stderr, "\n--- 利用可能なコマンド ---\n")
+	fmt.Fprintf(os.Stderr, "サブコマンド:\n")
+	for _, cmd := range rootCmd.Commands() {
+		if cmd.Use != "completion" && cmd.Use != "help" {
+			fmt.Fprintf(os.Stderr, "  %-15s %s\n", cmd.Use, cmd.Short)
+		}
+	}
+	
+	fmt.Fprintf(os.Stderr, "\nフラグ:\n")
+	rootCmd.Flags().VisitAll(func(flag *pflag.Flag) {
+		if flag.Name != "help" {
+			fmt.Fprintf(os.Stderr, "  --%-12s %s\n", flag.Name, flag.Usage)
+		}
+	})
+	rootCmd.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+		if flag.Name != "help" {
+			fmt.Fprintf(os.Stderr, "  --%-12s %s (global)\n", flag.Name, flag.Usage)
+		}
+	})
+	
+	fmt.Fprintf(os.Stderr, "\n=== Generated Completion Script ===\n")
+}
+
+// printDetailedInstructions は詳細なインストール手順を表示します。
+func printDetailedInstructions(shell string, programName string) {
+	fmt.Fprintf(os.Stderr, "\n=== 詳細インストール手順 ===\n")
+	fmt.Fprintf(os.Stderr, "シェル: %s\n\n", shell)
+
+	switch shell {
+	case "bash":
+		fmt.Fprintf(os.Stderr, "【Bash用補完スクリプト】\n\n")
+		fmt.Fprintf(os.Stderr, "1. 一時的な有効化（現在のセッションのみ）:\n")
+		fmt.Fprintf(os.Stderr, "   source <(%s auto-completion)\n\n", programName)
+		
+		fmt.Fprintf(os.Stderr, "2. 永続的な有効化（ユーザー用）:\n")
+		fmt.Fprintf(os.Stderr, "   echo 'source <(%s auto-completion)' >> ~/.bashrc\n", programName)
+		fmt.Fprintf(os.Stderr, "   source ~/.bashrc\n\n")
+		
+		fmt.Fprintf(os.Stderr, "3. システム全体での有効化（管理者権限必要）:\n")
+		fmt.Fprintf(os.Stderr, "   sudo %s auto-completion > /etc/bash_completion.d/%s\n\n", programName, programName)
+		
+		fmt.Fprintf(os.Stderr, "4. 手動でファイル保存:\n")
+		fmt.Fprintf(os.Stderr, "   %s auto-completion > ~/bash_completion_%s.sh\n", programName, programName)
+		fmt.Fprintf(os.Stderr, "   echo 'source ~/bash_completion_%s.sh' >> ~/.bashrc\n", programName)
+
+	case "zsh":
+		fmt.Fprintf(os.Stderr, "【Zsh用補完スクリプト】\n\n")
+		fmt.Fprintf(os.Stderr, "1. 一時的な有効化（現在のセッションのみ）:\n")
+		fmt.Fprintf(os.Stderr, "   source <(%s auto-completion)\n\n", programName)
+		
+		fmt.Fprintf(os.Stderr, "2. 永続的な有効化（ユーザー用）:\n")
+		fmt.Fprintf(os.Stderr, "   echo 'source <(%s auto-completion)' >> ~/.zshrc\n", programName)
+		fmt.Fprintf(os.Stderr, "   source ~/.zshrc\n\n")
+		
+		fmt.Fprintf(os.Stderr, "3. Zsh補完ディレクトリを使用:\n")
+		fmt.Fprintf(os.Stderr, "   mkdir -p ~/.zsh/completions\n")
+		fmt.Fprintf(os.Stderr, "   %s auto-completion > ~/.zsh/completions/_%s\n", programName, programName)
+		fmt.Fprintf(os.Stderr, "   echo 'fpath=(~/.zsh/completions $fpath)' >> ~/.zshrc\n")
+		fmt.Fprintf(os.Stderr, "   echo 'autoload -U compinit && compinit' >> ~/.zshrc\n\n")
+		
+		fmt.Fprintf(os.Stderr, "4. Oh My Zshを使用している場合:\n")
+		fmt.Fprintf(os.Stderr, "   %s auto-completion > ~/.oh-my-zsh/completions/_%s\n", programName, programName)
+
+	case "fish":
+		fmt.Fprintf(os.Stderr, "【Fish用補完スクリプト】\n\n")
+		fmt.Fprintf(os.Stderr, "1. 標準インストール方法:\n")
+		fmt.Fprintf(os.Stderr, "   mkdir -p ~/.config/fish/completions\n")
+		fmt.Fprintf(os.Stderr, "   %s auto-completion > ~/.config/fish/completions/%s.fish\n\n", programName, programName)
+		
+		fmt.Fprintf(os.Stderr, "2. 手動リロード（必要に応じて）:\n")
+		fmt.Fprintf(os.Stderr, "   fish -c 'complete -e %s; source ~/.config/fish/completions/%s.fish'\n\n", programName, programName)
+		
+		fmt.Fprintf(os.Stderr, "3. 補完テスト:\n")
+		fmt.Fprintf(os.Stderr, "   %s <TAB>\n", programName)
+
+	case "powershell", "pwsh":
+		fmt.Fprintf(os.Stderr, "【PowerShell用補完スクリプト】\n\n")
+		fmt.Fprintf(os.Stderr, "1. 現在のセッションでの有効化:\n")
+		fmt.Fprintf(os.Stderr, "   %s auto-completion | Out-String | Invoke-Expression\n\n", programName)
+		
+		fmt.Fprintf(os.Stderr, "2. PowerShellプロファイルに追加（永続的）:\n")
+		fmt.Fprintf(os.Stderr, "   %s auto-completion >> $PROFILE\n", programName)
+		fmt.Fprintf(os.Stderr, "   . $PROFILE\n\n")
+		
+		fmt.Fprintf(os.Stderr, "3. プロファイルファイルが存在しない場合:\n")
+		fmt.Fprintf(os.Stderr, "   New-Item -Type File -Path $PROFILE -Force\n")
+		fmt.Fprintf(os.Stderr, "   %s auto-completion >> $PROFILE\n\n", programName)
+		
+		fmt.Fprintf(os.Stderr, "4. 実行ポリシーの確認:\n")
+		fmt.Fprintf(os.Stderr, "   Get-ExecutionPolicy\n")
+		fmt.Fprintf(os.Stderr, "   # 必要に応じて: Set-ExecutionPolicy RemoteSigned -Scope CurrentUser\n")
+	}
+	
+	fmt.Fprintf(os.Stderr, "\n【補完動作の確認】\n")
+	fmt.Fprintf(os.Stderr, "インストール後、以下のコマンドでTABキーを押して補完をテスト:\n")
+	fmt.Fprintf(os.Stderr, "  %s <TAB>\n", programName)
+	fmt.Fprintf(os.Stderr, "  %s --<TAB>\n", programName)
+	fmt.Fprintf(os.Stderr, "  %s daemon --<TAB>\n", programName)
+	fmt.Fprintf(os.Stderr, "\n")
+}
+
+var autoCompletionCmd = &cobra.Command{
+	Use:   "auto-completion",
+	Short: "現在のシェル用の補完スクリプトを自動生成",
+	Long: `現在実行中のシェルを自動判定し、適切な補完スクリプトを生成します。
+サポートシェル: bash, zsh, fish, powershell
+
+フラグ:
+  --print  補完スクリプト生成時の詳細情報を表示
+
+手動でシェルを指定する場合:
+  rotate_backup completion bash
+  rotate_backup completion zsh
+  rotate_backup completion fish
+  rotate_backup completion powershell`,
+	Run: func(cmd *cobra.Command, args []string) {
+		// 現在のシェルを検出
+		detectedShell := detectCurrentShell()
+		programName := GetFileNameWithoutExt(os.Args[0])
+
+		if printDetails {
+			// 詳細情報を表示
+			printCompletionDetails(detectedShell, programName)
+		} else {
+			fmt.Fprintf(os.Stderr, "# 検出されたシェル: %s\n", detectedShell)
+		}
+
+		// 補完スクリプトを生成
+		if err := generateCompletionScript(detectedShell); err != nil {
+			fmt.Fprintf(os.Stderr, "補完スクリプト生成エラー: %v\n", err)
+			os.Exit(1)
+		}
+
+		// インストール方法を表示（--printフラグ時は詳細版）
+		if printDetails {
+			printDetailedInstructions(detectedShell, programName)
+		} else {
+			printCompletionInstructions(detectedShell, programName)
+		}
+	},
+}
 
 func init() {
 	// ルートコマンドのフラグ
@@ -542,9 +831,13 @@ func init() {
 	daemonCmd.Flags().StringVar(&pidFile, "pid-file", "rotate_backup.pid", "PIDファイルのパス")
 	daemonCmd.Flags().StringVar(&logLevel, "log-level", "info", "ログレベル (debug/info/warn/error)")
 
+	// auto-completionコマンドのフラグ
+	autoCompletionCmd.Flags().BoolVar(&printDetails, "print", false, "補完スクリプト生成時の詳細情報を表示")
+
 	// サブコマンドを追加
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(daemonCmd)
+	rootCmd.AddCommand(autoCompletionCmd)
 }
 
 func GetFileNameWithoutExt(path string) string {
@@ -598,6 +891,9 @@ func runOneShotMode(configPath string) error {
 		}
 	}
 	
+	// デバッグ: 設定値を確認
+	log.Printf("設定読み込み完了 - dry_run: %v", cfg.DryRun)
+	
 	// バックアップが必要かどうかを判定（重複実行防止含む）
 	shouldExecute, level, err := shouldExecuteBackup(cfg, now)
 	if err != nil {
@@ -605,7 +901,7 @@ func runOneShotMode(configPath string) error {
 	}
 	
 	if !shouldExecute {
-		log.Printf("[DRY-RUN] バックアップ不要: %s", now.Format("2006-01-02 15:04:05"))
+		log.Printf("バックアップ不要: %s", now.Format("2006-01-02 15:04:05"))
 		return nil
 	}
 	
