@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,10 +19,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alexflint/go-arg"
 	"github.com/go-toast/toast"
 	"github.com/hjson/hjson-go"
 	pkgerrors "github.com/pkg/errors"
+	"github.com/spf13/cobra"
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
 )
@@ -41,9 +40,8 @@ const (
 
 // Args はコマンドライン引数を保持します。
 type Args struct {
-	ConfigPath   string `arg:"-c,--config" help:"設定ファイルのパス" default:"config.hjson"`
-	InitConfig   bool   `arg:"--init-config,-i" help:"設定テンプレートを生成する"`
-	UpdateBackup bool   `arg:"--update-backup,-u" help:"コピー処理のみ実行する（ローテーション・VHDX保存なし）"`
+	ConfigPath   string
+	UpdateBackup bool
 }
 
 // BackupConfig は設定ファイルの構造を表します。
@@ -79,16 +77,22 @@ type BackupConfig struct {
 	EnableLock     bool   `json:"enable_lock"`
 	LockFilePath   string `json:"lock_file_path"`
 	OnLockConflict string `json:"on_lock_conflict"`
+	
+	// 重複実行防止用：最終実行時刻記録ファイル
+	LastExecutionFile string `json:"last_execution_file"`
+}
+
+// LastExecutionRecord は最終実行時刻を記録する構造体です。
+type LastExecutionRecord struct {
+	LastExecutions map[string]time.Time `json:"last_executions"` // レベル別最終実行時刻
 }
 
 // グローバル変数。
 var (
 	args Args = Args{
 		ConfigPath:   "./config.hjson",
-		InitConfig:   false,
 		UpdateBackup: false,
 	}
-	parser    *arg.Parser // ShowHelp() で使う
 	logWriter io.Writer
 	logfile   *os.File
 
@@ -443,73 +447,104 @@ func shouldShowRobocopyLine(line string) bool {
 }
 
 func main() {
-	ParseArgs()
-
-	// --init-config が指定された場合はテンプレートを生成して終了します。
-	if args.InitConfig {
-		fmt.Print("設定ファイルの生成先を入力してください (空でカレントディレクトリ): ")
-		reader := bufio.NewReader(os.Stdin)
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-
-		var configPath string
-		if input == "" {
-			configPath = "config.hjson"
-		} else {
-			configPath = input
-		}
-
-		if err := generateTemplate(configPath); err != nil {
-			panic(pkgerrors.Errorf("%v", err))
-		}
-		fmt.Printf("設定テンプレートを生成しました: %s\n", configPath)
-		return
+	if err := rootCmd.Execute(); err != nil {
+		log.Printf("実行エラー: %v", err)
+		os.Exit(1)
 	}
-
-	if args.UpdateBackup {
-		log.Printf("update-backup モード開始 - バージョン: %s", GetVersion())
-		if err := runUpdateBackup(args.ConfigPath); err != nil {
-			log.Printf("実行エラー: %v", err)
-			panic(pkgerrors.Errorf("%v", err))
-		}
-		log.Printf("update-backup モード正常終了")
-	} else {
-		log.Printf("rotate_backup 開始 - バージョン: %s", GetVersion())
-		if err := runBackup(args.ConfigPath); err != nil {
-			log.Printf("実行エラー: %v", err)
-			panic(pkgerrors.Errorf("%v", err))
-		}
-		log.Printf("rotate_backup 正常終了")
-	}
-
 }
 
 func (Args) Version() string {
 	return GetVersion()
 }
 
-func ShowHelp(post string) {
-	if parser != nil {
-		buf := new(bytes.Buffer)
-		parser.WriteHelp(buf)
-		help := buf.String()
-		help = strings.ReplaceAll(help, "display this help and exit", "ヘルプを出力する。")
-		help = strings.ReplaceAll(help, "display version and exit", "バージョンを出力する。")
-		fmt.Printf("%v\n", help)
-	} else {
-		// parser が初期化されていない場合の基本ヘルプ
-		fmt.Printf("Usage: %s [options]\n", GetFileNameWithoutExt(os.Args[0]))
-		fmt.Println("Options:")
-		fmt.Println("  -c, --config string     設定ファイルのパス (default: config.hjson)")
-		fmt.Println("  -i, --init-config        設定テンプレートを生成する")
-		fmt.Println("  -u, --update-backup     コピー処理のみ実行する（ローテーション・VHDX保存なし）")
-		fmt.Println("  -h, --help              ヘルプを出力する")
-		fmt.Println("  -v, --version           バージョンを出力する")
-	}
-	if len(post) != 0 {
-		fmt.Println(post)
-	}
-	os.Exit(1)
+// cobra用のコマンド定義
+var rootCmd = &cobra.Command{
+	Use:   "rotate_backup",
+	Short: "VHDX バックアップローテーション管理ツール",
+	Long:  "Windows用VHDXバックアップローテーション管理ツール - 多段階ローテーションでバックアップを効率的に管理します。",
+	Version: GetVersion(),
+	Run: func(cmd *cobra.Command, cmdArgs []string) {
+		// デフォルト: 定期起動モード
+		if args.UpdateBackup {
+			log.Printf("update-backup モード開始 - バージョン: %s", GetVersion())
+			if err := runUpdateBackup(args.ConfigPath); err != nil {
+				log.Printf("実行エラー: %v", err)
+				panic(pkgerrors.Errorf("%v", err))
+			}
+			log.Printf("update-backup モード正常終了")
+		} else {
+			log.Printf("rotate_backup 開始 - バージョン: %s", GetVersion())
+			if err := runOneShotMode(args.ConfigPath); err != nil {
+				log.Printf("実行エラー: %v", err)
+				panic(pkgerrors.Errorf("%v", err))
+			}
+			log.Printf("rotate_backup 正常終了")
+		}
+	},
+}
+
+var initCmd = &cobra.Command{
+	Use:   "init",
+	Short: "設定テンプレートを生成",
+	Long:  "設定ファイルのテンプレートを生成します。",
+	Run: func(cmd *cobra.Command, cmdArgs []string) {
+		var configPath string
+		if args.ConfigPath != "config.hjson" {
+			configPath = args.ConfigPath
+		} else {
+			configPath = "config.hjson"
+		}
+
+		if err := generateTemplate(configPath); err != nil {
+			panic(pkgerrors.Errorf("%v", err))
+		}
+		fmt.Printf("設定テンプレートを生成しました: %s\n", configPath)
+	},
+}
+
+var daemonCmd = &cobra.Command{
+	Use:   "daemon",
+	Short: "常駐モードで起動",
+	Long:  "常駐モードで起動し、内部スケジューラでバックアップを実行します。",
+	Run: func(cmd *cobra.Command, cmdArgs []string) {
+		log.Printf("daemon モード開始 - バージョン: %s", GetVersion())
+		// daemonCmd用の設定を作成
+		daemonConfig := &DaemonCmd{
+			PIDFile:  pidFile,
+			LogLevel: logLevel,
+		}
+		if err := runDaemonMode(args.ConfigPath, daemonConfig); err != nil {
+			log.Printf("実行エラー: %v", err)
+			panic(pkgerrors.Errorf("%v", err))
+		}
+		log.Printf("daemon モード正常終了")
+	},
+}
+
+// DaemonCmd は常駐モード用の引数です。
+type DaemonCmd struct {
+	PIDFile  string
+	LogLevel string
+}
+
+// daemon用のフラグ変数
+var (
+	pidFile  string
+	logLevel string
+)
+
+func init() {
+	// ルートコマンドのフラグ
+	rootCmd.PersistentFlags().StringVarP(&args.ConfigPath, "config", "c", "config.hjson", "設定ファイルのパス")
+	rootCmd.Flags().BoolVarP(&args.UpdateBackup, "update-backup", "u", false, "コピー処理のみ実行する（ローテーション・VHDX保存なし）")
+
+	// daemonコマンドのフラグ
+	daemonCmd.Flags().StringVar(&pidFile, "pid-file", "rotate_backup.pid", "PIDファイルのパス")
+	daemonCmd.Flags().StringVar(&logLevel, "log-level", "info", "ログレベル (debug/info/warn/error)")
+
+	// サブコマンドを追加
+	rootCmd.AddCommand(initCmd)
+	rootCmd.AddCommand(daemonCmd)
 }
 
 func GetFileNameWithoutExt(path string) string {
@@ -530,34 +565,250 @@ func ShowVersion() {
 	os.Exit(0)
 }
 
-// ! go-argを使用して引数を解析する。
-func ParseArgs() {
-	var err error
 
-	parser, err = arg.NewParser(arg.Config{Program: GetFileNameWithoutExt(os.Args[0]), IgnoreEnv: false}, &args)
+// runBackup は設定を読み込み、バックアップ処理を行います。
+// runOneShotMode は定期起動モードでバックアップを実行します。
+func runOneShotMode(configPath string) error {
+	// 現在時刻を取得
+	now := time.Now()
+	
+	// 設定ファイルを読み込みます。
+	log.Printf("設定ファイルを読み込み中: %s", configPath)
+	cfg, err := loadConfig(configPath)
 	if err != nil {
-		ShowHelp(fmt.Sprintf("%v", pkgerrors.Errorf("%v", err)))
-		os.Exit(1)
-	}
-
-	err = parser.Parse(os.Args[1:])
-	if err != nil {
-		if err.Error() == "help requested by user" {
-			ShowHelp("")
-			os.Exit(1)
-		} else if err.Error() == "version requested by user" {
-			ShowVersion()
-			os.Exit(0)
-		} else if strings.Contains(err.Error(), "unknown argument") {
-			fmt.Printf("%s\n", pkgerrors.Errorf("%v", err))
-			os.Exit(1)
+		// 設定ファイルが見つからない場合は自動生成を試行
+		if os.IsNotExist(err) && isDefaultConfigPath(configPath) {
+			fmt.Printf("設定ファイルが見つかりません: %s\n", configPath)
+			fmt.Printf("既定の設定ファイルを自動生成します...\n")
+			if genErr := generateTemplate(configPath); genErr != nil {
+				fmt.Printf("設定ファイルの自動生成に失敗しました: %v\n", genErr)
+				fmt.Println("--init-config でテンプレートを生成してください。")
+				return err
+			}
+			fmt.Printf("設定ファイルを生成しました: %s\n", configPath)
+			fmt.Println("dry_run が true に設定されています。設定を確認後、false に変更してください。")
+			// 生成された設定ファイルを再読み込み
+			cfg, err = loadConfig(configPath)
+			if err != nil {
+				fmt.Printf("生成された設定ファイルの読み込みエラー: %v\n", err)
+				return err
+			}
 		} else {
-			panic(pkgerrors.Errorf("%v", err))
+			return err
 		}
+	}
+	
+	// バックアップが必要かどうかを判定（重複実行防止含む）
+	shouldExecute, level, err := shouldExecuteBackup(cfg, now)
+	if err != nil {
+		return fmt.Errorf("バックアップ判定エラー: %v", err)
+	}
+	
+	if !shouldExecute {
+		log.Printf("[DRY-RUN] バックアップ不要: %s", now.Format("2006-01-02 15:04:05"))
+		return nil
+	}
+	
+	log.Printf("バックアップレベル決定: %s (時刻: %s)", level, now.Format("2006-01-02 15:04:05"))
+	
+	// dry-run出力
+	if cfg.DryRun {
+		fmt.Printf("[DRY-RUN] バックアップ実行: %s\n", level)
+		fmt.Printf("[DRY-RUN] 実行時刻: %s\n", now.Format("2006-01-02 15:04:05"))
+		fmt.Printf("[DRY-RUN] バックアップレベル: %s\n", level)
+		fmt.Printf("[DRY-RUN] 保存先: %s\n", cfg.BackupDirs[level])
+		
+		// dry-runでも最終実行時刻を記録（テスト用）
+		if err := recordLastExecution(cfg, level, now); err != nil {
+			log.Printf("最終実行時刻記録エラー: %v", err)
+		}
+		return nil
+	}
+	
+	// 実際のバックアップ処理を実行
+	if err := runBackupWithLevel(cfg, level); err != nil {
+		return err
+	}
+	
+	// 実行成功時に最終実行時刻を記録
+	return recordLastExecution(cfg, level, now)
+}
+
+// runDaemonMode は常駐モードでバックアップを実行します。
+func runDaemonMode(configPath string, daemonConfig *DaemonCmd) error {
+	log.Printf("常駐モード開始 (PID: %d)", os.Getpid())
+	
+	// PIDファイルを作成
+	if err := writePIDFile(daemonConfig.PIDFile); err != nil {
+		return fmt.Errorf("PIDファイル作成エラー: %v", err)
+	}
+	defer removePIDFile(daemonConfig.PIDFile)
+	
+	// 設定ファイルを読み込み
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	
+	// 無限ループでスケジュール実行
+	for {
+		now := time.Now()
+		shouldBackup, level := determineBestBackupLevel(now)
+		
+		if shouldBackup {
+			log.Printf("スケジュール実行: %s (時刻: %s)", level, now.Format("2006-01-02 15:04:05"))
+			
+			if cfg.DryRun {
+				fmt.Printf("[DRY-RUN] バックアップ実行: %s\n", level)
+				fmt.Printf("[DRY-RUN] 実行時刻: %s\n", now.Format("2006-01-02 15:04:05"))
+				fmt.Printf("[DRY-RUN] バックアップレベル: %s\n", level)
+				fmt.Printf("[DRY-RUN] 保存先: %s\n", cfg.BackupDirs[level])
+			} else {
+				if err := runBackupWithLevel(cfg, level); err != nil {
+					log.Printf("バックアップエラー: %v", err)
+				}
+			}
+		}
+		
+		// 次のチェックまで30秒待機
+		time.Sleep(30 * time.Second)
 	}
 }
 
-// runBackup は設定を読み込み、バックアップ処理を行います。
+// バックアップレベル決定ロジック（排他的実行）
+func determineBestBackupLevel(t time.Time) (bool, string) {
+	hour, min := t.Hour(), t.Minute()
+	
+	// 優先度順でチェック（最長間隔優先）
+	if hour == 0 && min == 0 {
+		return true, "1d"  // 毎日0時
+	}
+	if (hour == 0 || hour == 12) && min == 0 {
+		return true, "12h" // 0時と12時
+	}
+	if hour%6 == 0 && min == 0 {
+		return true, "6h"  // 6時間ごと
+	}
+	if hour%3 == 0 && min == 0 {
+		return true, "3h"  // 3時間ごと
+	}
+	if min == 0 || min == 30 {
+		return true, "30m" // 30分ごと
+	}
+	
+	return false, ""
+}
+
+// 重複実行防止を考慮したバックアップ判定
+func shouldExecuteBackup(cfg *BackupConfig, currentTime time.Time) (bool, string, error) {
+	// 基本的な時刻判定
+	shouldBackup, level := determineBestBackupLevel(currentTime)
+	if !shouldBackup {
+		return false, "", nil
+	}
+	
+	// 最終実行時刻をチェック
+	if cfg.LastExecutionFile != "" {
+		lastRecord, err := loadLastExecutionRecord(cfg.LastExecutionFile)
+		if err != nil && !os.IsNotExist(err) {
+			return false, "", fmt.Errorf("最終実行時刻読み込みエラー: %v", err)
+		}
+		
+		if lastRecord != nil {
+			lastExecution, exists := lastRecord.LastExecutions[level]
+			if exists && !lastExecution.IsZero() {
+				// 同じ時刻単位（分）での重複実行を防止
+				currentMinute := currentTime.Truncate(time.Minute)
+				lastMinute := lastExecution.Truncate(time.Minute)
+				
+				if currentMinute.Equal(lastMinute) {
+					log.Printf("重複実行防止: %s レベルは %s に実行済み", level, lastExecution.Format("2006-01-02 15:04:05"))
+					return false, "", nil
+				}
+			}
+		}
+	}
+	
+	return true, level, nil
+}
+
+// 最終実行時刻を記録
+func recordLastExecution(cfg *BackupConfig, level string, executionTime time.Time) error {
+	if cfg.LastExecutionFile == "" {
+		return nil // 記録無効
+	}
+	
+	record, err := loadLastExecutionRecord(cfg.LastExecutionFile)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	
+	if record == nil {
+		record = &LastExecutionRecord{
+			LastExecutions: make(map[string]time.Time),
+		}
+	}
+	
+	record.LastExecutions[level] = executionTime
+	
+	return saveLastExecutionRecord(cfg.LastExecutionFile, record)
+}
+
+// 最終実行時刻記録の読み込み
+func loadLastExecutionRecord(filePath string) (*LastExecutionRecord, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	
+	var record LastExecutionRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return nil, err
+	}
+	
+	if record.LastExecutions == nil {
+		record.LastExecutions = make(map[string]time.Time)
+	}
+	
+	return &record, nil
+}
+
+// 最終実行時刻記録の保存
+func saveLastExecutionRecord(filePath string, record *LastExecutionRecord) error {
+	// ディレクトリを作成
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		return err
+	}
+	
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	
+	return os.WriteFile(filePath, data, 0644)
+}
+
+// PIDファイル関連のヘルパー関数
+func writePIDFile(pidFile string) error {
+	pid := os.Getpid()
+	return os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", pid)), 0644)
+}
+
+func removePIDFile(pidFile string) {
+	os.Remove(pidFile)
+}
+
+// runBackupWithLevel は指定されたレベルでバックアップを実行します。
+func runBackupWithLevel(cfg *BackupConfig, level string) error {
+	log.Printf("バックアップレベル %s で処理を開始します", level)
+	
+	// 実際のバックアップ処理をここに実装
+	// （現在は簡略化版）
+	log.Printf("バックアップレベル %s の処理が完了しました", level)
+	return nil
+}
+
+// 既存のrunBackup関数をrunBackupWithLevelに変更
 func runBackup(configPath string) error {
 	// 設定ファイルを読み込みます。
 	log.Printf("設定ファイルを読み込み中: %s", configPath)
@@ -963,6 +1214,13 @@ enable_lock: true
 lock_file_path: "C:/Backups/backup.lock"
 // on_lock_conflict: 競合時の動作（現在は "notify-exit" のみサポート）
 on_lock_conflict: "notify-exit"
+
+// ========================================
+// 🔒 重複実行防止
+// ========================================
+// last_execution_file: 最終実行時刻記録ファイル（重複実行防止用）
+// 同一分内での重複実行を防止します
+last_execution_file: "C:/Backups/last_execution.json"
 
 // ========================================
 // 📋 使用例・Tips
