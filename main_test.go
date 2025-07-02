@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1229,4 +1230,79 @@ func TestDetermineBestBackupLevelTiming(t *testing.T) {
 				tt.name, shouldRun, level, tt.description)
 		})
 	}
+}
+// =============================================================================
+// ログバッファリング機能のテスト  
+// =============================================================================
+
+func TestLogBuffer(t *testing.T) {
+	// LogBuffer のテスト
+	buffer := &LogBuffer{
+		buffer: &bytes.Buffer{},
+	}
+	
+	// データを書き込み
+	testData := "テストログメッセージ\n"
+	n, err := buffer.Write([]byte(testData))
+	if err != nil {
+		t.Fatalf("LogBuffer.Write() エラー: %v", err)
+	}
+	if n != len(testData) {
+		t.Errorf("書き込みバイト数が違います: 期待=%d, 実際=%d", len(testData), n)
+	}
+	
+	// データを取得してクリア
+	data := buffer.GetAndClear()
+	if string(data) != testData {
+		t.Errorf("取得データが違います: 期待=%s, 実際=%s", testData, string(data))
+	}
+	
+	// クリア後は空であることを確認
+	data2 := buffer.GetAndClear()
+	if len(data2) != 0 {
+		t.Errorf("クリア後にデータが残っています: %s", string(data2))
+	}
+}
+
+func TestMultiWriter(t *testing.T) {
+	// MultiWriter のテスト
+	var buf1, buf2 bytes.Buffer
+	
+	mw := &MultiWriter{
+		writers: []io.Writer{&buf1, &buf2},
+	}
+	
+	// データを書き込み
+	testData := "マルチライターテスト\n"
+	n, err := mw.Write([]byte(testData))
+	if err != nil {
+		t.Fatalf("MultiWriter.Write() エラー: %v", err)
+	}
+	if n != len(testData) {
+		t.Errorf("書き込みバイト数が違います: 期待=%d, 実際=%d", len(testData), n)
+	}
+	
+	// 両方のバッファにデータが書き込まれているか確認
+	if buf1.String() != testData {
+		t.Errorf("buf1のデータが違います: 期待=%s, 実際=%s", testData, buf1.String())
+	}
+	if buf2.String() != testData {
+		t.Errorf("buf2のデータが違います: 期待=%s, 実際=%s", testData, buf2.String())
+	}
+}
+
+func TestSetupLogOutput(t *testing.T) {
+	// setupLogOutput のテスト（ファイル作成なしでテスト）
+	cfg := &BackupConfig{
+		LogFile: "", // ログファイル未設定
+	}
+	
+	// ログファイル未設定の場合はエラーなしで終了
+	err := setupLogOutput(cfg)
+	if err != nil {
+		t.Errorf("ログファイル未設定でエラーが発生: %v", err)
+	}
+	
+	// 実際のファイル作成テストは統合テストで行う
+	t.Log("setupLogOutput() の基本動作テスト完了")
 }

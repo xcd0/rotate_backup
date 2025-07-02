@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-toast/toast"
@@ -88,14 +90,74 @@ type LastExecutionRecord struct {
 	LastExecutions map[string]time.Time `json:"last_executions"` // レベル別最終実行時刻
 }
 
+// ログバッファリング用の構造体
+type LogBuffer struct {
+	buffer *bytes.Buffer
+	mutex  sync.Mutex
+}
+
+func (lb *LogBuffer) Write(p []byte) (n int, err error) {
+	lb.mutex.Lock()
+	defer lb.mutex.Unlock()
+	return lb.buffer.Write(p)
+}
+
+func (lb *LogBuffer) GetAndClear() []byte {
+	lb.mutex.Lock()
+	defer lb.mutex.Unlock()
+	data := lb.buffer.Bytes()
+	result := make([]byte, len(data))
+	copy(result, data)
+	lb.buffer.Reset()
+	return result
+}
+
+// マルチライター：複数の出力先に同時出力
+type MultiWriter struct {
+	writers []io.Writer
+	mutex   sync.Mutex
+}
+
+func (mw *MultiWriter) Write(p []byte) (n int, err error) {
+	mw.mutex.Lock()
+	defer mw.mutex.Unlock()
+	
+	for _, writer := range mw.writers {
+		if _, writeErr := writer.Write(p); writeErr != nil {
+			// ログ出力なので、エラーがあってもスキップして続行
+			continue
+		}
+	}
+	return len(p), nil
+}
+
+func (mw *MultiWriter) AddWriter(writer io.Writer) {
+	mw.mutex.Lock()
+	defer mw.mutex.Unlock()
+	mw.writers = append(mw.writers, writer)
+}
+
+func (mw *MultiWriter) RemoveWriter(writer io.Writer) {
+	mw.mutex.Lock()
+	defer mw.mutex.Unlock()
+	for i, w := range mw.writers {
+		if w == writer {
+			mw.writers = append(mw.writers[:i], mw.writers[i+1:]...)
+			break
+		}
+	}
+}
+
 // グローバル変数。
 var (
 	args Args = Args{
 		ConfigPath:   "./config.hjson",
 		UpdateBackup: false,
 	}
-	logWriter io.Writer
-	logfile   *os.File
+	logWriter   io.Writer
+	logfile     *os.File
+	logBuffer   *LogBuffer
+	multiWriter *MultiWriter
 
 	version  string = "debug build"   // makefileからビルドされると上書きされる。
 	revision string = func() string { // {{{
@@ -123,9 +185,62 @@ var (
 )
 
 func init() {
-	// ログを標準エラー出力に設定し、時間とファイル位置を含むフォーマットにする。
-	log.SetOutput(os.Stderr)
+	// ログバッファとマルチライターを初期化
+	logBuffer = &LogBuffer{
+		buffer: &bytes.Buffer{},
+	}
+	multiWriter = &MultiWriter{
+		writers: []io.Writer{os.Stderr, logBuffer},
+	}
+	
+	// 初期状態では標準エラーとバッファに出力
+	log.SetOutput(multiWriter)
 	log.SetFlags(log.Ltime | log.Lshortfile)
+	
+	log.Printf("ログシステム初期化完了 - 出力先: 標準エラー + バッファ")
+}
+
+// setupLogOutput は設定ファイル読み込み後にログ出力先を設定します
+func setupLogOutput(cfg *BackupConfig) error {
+	if cfg.LogFile == "" {
+		log.Printf("ログファイル未設定 - 標準エラー出力のみ継続")
+		return nil
+	}
+	
+	log.Printf("ログファイル設定開始: %s", cfg.LogFile)
+	
+	// ログファイルを開く
+	logfile, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("ログファイルオープンエラー: %v", err)
+		return fmt.Errorf("ログファイルオープンエラー: %v", err)
+	}
+	
+	// バッファに溜まったログを先にファイルに出力
+	bufferedLogs := logBuffer.GetAndClear()
+	if len(bufferedLogs) > 0 {
+		if _, err := logfile.Write(bufferedLogs); err != nil {
+			log.Printf("バッファ済みログのファイル出力エラー: %v", err)
+		} else {
+			log.Printf("バッファ済みログをファイルに出力しました (%d bytes)", len(bufferedLogs))
+		}
+	}
+	
+	// マルチライターからバッファを削除し、ログファイルを追加
+	multiWriter.RemoveWriter(logBuffer)
+	multiWriter.AddWriter(logfile)
+	
+	log.Printf("ログ出力先変更完了 - 出力先: 標準エラー + %s", cfg.LogFile)
+	return nil
+}
+
+// closeLogFile はログファイルを安全に閉じます
+func closeLogFile() {
+	if logfile != nil {
+		log.Printf("ログファイルを閉じます")
+		logfile.Close()
+		logfile = nil
+	}
 }
 
 // convertShiftJISToUTF8 はShift_JISエンコードされたバイト列をUTF-8文字列に変換します。
@@ -448,6 +563,9 @@ func shouldShowRobocopyLine(line string) bool {
 }
 
 func main() {
+	// プログラム終了時にログファイルをクローズ
+	defer closeLogFile()
+	
 	if err := rootCmd.Execute(); err != nil {
 		log.Printf("実行エラー: %v", err)
 		os.Exit(1)
@@ -894,6 +1012,12 @@ func runOneShotMode(configPath string) error {
 	// デバッグ: 設定値を確認
 	log.Printf("設定読み込み完了 - dry_run: %v", cfg.DryRun)
 	
+	// ログ出力先を設定ファイルに基づいて切り替え
+	if err := setupLogOutput(cfg); err != nil {
+		log.Printf("ログ出力設定エラー: %v", err)
+		return fmt.Errorf("ログ出力設定エラー: %v", err)
+	}
+	
 	// バックアップが必要かどうかを判定（重複実行防止含む）
 	shouldExecute, level, err := shouldExecuteBackup(cfg, now)
 	if err != nil {
@@ -944,6 +1068,12 @@ func runDaemonMode(configPath string, daemonConfig *DaemonCmd) error {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return err
+	}
+	
+	// ログ出力先を設定ファイルに基づいて切り替え
+	if err := setupLogOutput(cfg); err != nil {
+		log.Printf("ログ出力設定エラー: %v", err)
+		return fmt.Errorf("ログ出力設定エラー: %v", err)
 	}
 	
 	// 無限ループでスケジュール実行
@@ -1135,34 +1265,17 @@ func runBackup(configPath string) error {
 	}
 	log.Printf("設定ファイルの読み込みが完了しました")
 
+	// ログ出力先を設定ファイルに基づいて切り替え
+	if err := setupLogOutput(cfg); err != nil {
+		log.Printf("ログ出力設定エラー: %v", err)
+		return fmt.Errorf("ログ出力設定エラー: %v", err)
+	}
+
 	// dry_run フラグが true ならドライランモードで処理します。
 	if cfg.DryRun {
 		fmt.Println("=== DRY RUN MODE ===")
 		fmt.Println("実際の処理は実行せず、動作をシミュレートします。")
 		fmt.Println()
-	}
-
-	// ログファイルが指定されていればログ出力先を切り替えます。
-	log.Printf("log file: %v", cfg.LogFile)
-	if cfg.LogFile != "" {
-		var err error
-
-		if err = os.MkdirAll(filepath.Dir(cfg.LogFile), 0755); err != nil {
-			panic(pkgerrors.Errorf("ログファイル出力先親ディレクトリ作成エラー: %v", err)) // コピー先ディレクトリ作成に失敗した場合。
-		}
-		logfile, err := os.Create(cfg.LogFile)
-		if err != nil {
-			panic(pkgerrors.Errorf("%v", err))
-		}
-
-		//logfile, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-		logfile, err = os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Printf("Error: ログファイルオープン失敗: %v", err)
-			return pkgerrors.Errorf("ログファイルオープン失敗: %v", err)
-		}
-		logWriter = io.MultiWriter(os.Stdout, logfile)
-		log.SetOutput(logWriter)
 	}
 
 	// 多重実行防止のためファイルロックを取得します。
@@ -1296,33 +1409,17 @@ func runUpdateBackup(configPath string) error {
 	}
 	log.Printf("設定ファイルの読み込みが完了しました")
 
+	// ログ出力先を設定ファイルに基づいて切り替え
+	if err := setupLogOutput(cfg); err != nil {
+		log.Printf("ログ出力設定エラー: %v", err)
+		return fmt.Errorf("ログ出力設定エラー: %v", err)
+	}
+
 	// dry_run フラグが true ならドライランモードで処理します。
 	if cfg.DryRun {
 		fmt.Println("=== DRY RUN MODE (UPDATE-BACKUP) ===")
 		fmt.Println("実際の処理は実行せず、コピー動作をシミュレートします。")
 		fmt.Println()
-	}
-
-	// ログファイルが指定されていればログ出力先を切り替えます。
-	log.Printf("log file: %v", cfg.LogFile)
-	if cfg.LogFile != "" {
-		var err error
-
-		if err = os.MkdirAll(filepath.Dir(cfg.LogFile), 0755); err != nil {
-			panic(pkgerrors.Errorf("ログファイル出力先親ディレクトリ作成エラー: %v", err))
-		}
-		logfile, err := os.Create(cfg.LogFile)
-		if err != nil {
-			panic(pkgerrors.Errorf("%v", err))
-		}
-
-		logfile, err = os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Printf("Error: ログファイルオープン失敗: %v", err)
-			return pkgerrors.Errorf("ログファイルオープン失敗: %v", err)
-		}
-		logWriter = io.MultiWriter(os.Stdout, logfile)
-		log.SetOutput(logWriter)
 	}
 
 	// 全体処理開始時刻を記録します。
