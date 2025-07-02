@@ -1104,57 +1104,109 @@ func runDaemonMode(configPath string, daemonConfig *DaemonCmd) error {
 // バックアップレベル決定ロジック（排他的実行）
 func determineBestBackupLevel(t time.Time) (bool, string) {
 	hour, min := t.Hour(), t.Minute()
+	log.Printf("--- バックアップレベル判定開始 ---")
+	log.Printf("時刻: %02d時%02d分", hour, min)
 	
 	// 優先度順でチェック（最長間隔優先）
 	if hour == 0 && min == 0 {
+		log.Printf("✓ 1d判定: %02d時%02d分は毎日0時に該当", hour, min)
 		return true, "1d"  // 毎日0時
 	}
+	log.Printf("✗ 1d判定: %02d時%02d分は毎日0時(00:00)に該当しない", hour, min)
+	
 	if (hour == 0 || hour == 12) && min == 0 {
+		log.Printf("✓ 12h判定: %02d時%02d分は12時間間隔(00:00または12:00)に該当", hour, min)
 		return true, "12h" // 0時と12時
 	}
+	log.Printf("✗ 12h判定: %02d時%02d分は12時間間隔(00:00,12:00)に該当しない", hour, min)
+	
 	if hour%6 == 0 && min == 0 {
+		log.Printf("✓ 6h判定: %02d時%02d分は6時間間隔(00,06,12,18:00)に該当", hour, min)
 		return true, "6h"  // 6時間ごと
 	}
+	log.Printf("✗ 6h判定: %02d時%02d分は6時間間隔(00,06,12,18:00)に該当しない (hour%%6=%d)", hour, min, hour%6)
+	
 	if hour%3 == 0 && min == 0 {
+		log.Printf("✓ 3h判定: %02d時%02d分は3時間間隔(00,03,06,09,12,15,18,21:00)に該当", hour, min)
 		return true, "3h"  // 3時間ごと
 	}
+	log.Printf("✗ 3h判定: %02d時%02d分は3時間間隔(00,03,06,09,12,15,18,21:00)に該当しない (hour%%3=%d)", hour, min, hour%3)
+	
 	if min == 0 || min == 30 {
+		log.Printf("✓ 30m判定: %02d時%02d分は30分間隔(毎時00分または30分)に該当", hour, min)
 		return true, "30m" // 30分ごと
 	}
+	log.Printf("✗ 30m判定: %02d時%02d分は30分間隔(毎時00分または30分)に該当しない", hour, min)
 	
+	log.Printf("判定結果: すべての条件に該当しないため、バックアップ不要")
+	log.Printf("--- バックアップレベル判定終了 ---")
 	return false, ""
 }
 
 // 重複実行防止を考慮したバックアップ判定
 func shouldExecuteBackup(cfg *BackupConfig, currentTime time.Time) (bool, string, error) {
+	// デバッグ: バックアップ判定開始
+	log.Printf("=== バックアップ判定開始 ===")
+	log.Printf("現在時刻: %s", currentTime.Format("2006-01-02 15:04:05"))
+	log.Printf("現在時刻詳細: %02d時%02d分%02d秒", currentTime.Hour(), currentTime.Minute(), currentTime.Second())
+	
 	// 基本的な時刻判定
 	shouldBackup, level := determineBestBackupLevel(currentTime)
+	log.Printf("時刻判定結果: shouldBackup=%v, level=%s", shouldBackup, level)
+	
 	if !shouldBackup {
+		log.Printf("判定結果: バックアップ実行タイミング外（%02d:%02d は 30分間隔の実行タイミング外）", 
+			currentTime.Hour(), currentTime.Minute())
 		return false, "", nil
 	}
 	
 	// 最終実行時刻をチェック
+	log.Printf("重複実行防止チェック開始")
 	if cfg.LastExecutionFile != "" {
+		log.Printf("最終実行時刻ファイル: %s", cfg.LastExecutionFile)
 		lastRecord, err := loadLastExecutionRecord(cfg.LastExecutionFile)
 		if err != nil && !os.IsNotExist(err) {
+			log.Printf("最終実行時刻読み込みエラー: %v", err)
 			return false, "", fmt.Errorf("最終実行時刻読み込みエラー: %v", err)
 		}
 		
-		if lastRecord != nil {
+		if os.IsNotExist(err) {
+			log.Printf("最終実行時刻ファイルが存在しません（初回実行）")
+		} else if lastRecord == nil {
+			log.Printf("最終実行時刻記録が空です")
+		} else {
+			log.Printf("最終実行時刻記録を読み込みました")
 			lastExecution, exists := lastRecord.LastExecutions[level]
-			if exists && !lastExecution.IsZero() {
+			if !exists {
+				log.Printf("レベル %s の前回実行記録はありません（初回実行）", level)
+			} else if lastExecution.IsZero() {
+				log.Printf("レベル %s の前回実行時刻がゼロ値です", level)
+			} else {
 				// 同じ時刻単位（分）での重複実行を防止
 				currentMinute := currentTime.Truncate(time.Minute)
 				lastMinute := lastExecution.Truncate(time.Minute)
 				
+				log.Printf("前回実行時刻: %s", lastExecution.Format("2006-01-02 15:04:05"))
+				log.Printf("前回実行時刻（分単位）: %s", lastMinute.Format("2006-01-02 15:04"))
+				log.Printf("現在時刻（分単位）: %s", currentMinute.Format("2006-01-02 15:04"))
+				
+				timeDiff := currentTime.Sub(lastExecution)
+				log.Printf("時刻差分: %v", timeDiff)
+				
 				if currentMinute.Equal(lastMinute) {
-					log.Printf("重複実行防止: %s レベルは %s に実行済み", level, lastExecution.Format("2006-01-02 15:04:05"))
+					log.Printf("重複実行防止: %s レベルは %s に実行済み（同一分内）", level, lastExecution.Format("2006-01-02 15:04:05"))
 					return false, "", nil
+				} else {
+					log.Printf("重複実行ではありません: 異なる分での実行")
 				}
 			}
 		}
+	} else {
+		log.Printf("最終実行時刻ファイルが設定されていません（重複実行防止無効）")
 	}
 	
+	log.Printf("判定結果: バックアップ実行許可 - レベル %s", level)
+	log.Printf("=== バックアップ判定終了 ===")
 	return true, level, nil
 }
 
